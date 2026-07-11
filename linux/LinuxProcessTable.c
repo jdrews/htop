@@ -40,6 +40,7 @@ in the source distribution for its full text.
 #include "Table.h"
 #include "UsersTable.h"
 #include "linux/CGroupUtils.h"
+#include "linux/ContainerResolver.h"
 #include "linux/Compat.h"
 #include "linux/GPU.h"
 #include "linux/LinuxMachine.h"
@@ -265,10 +266,12 @@ ProcessTable* ProcessTable_new(Machine* host, Hashtable* pidMatchList) {
    ProcessTable* super = &this->super;
    ProcessTable_init(super, Class(LinuxProcess), host, pidMatchList);
 
-   LinuxProcessTable_initTtyDrivers(this);
+    LinuxProcessTable_initTtyDrivers(this);
 
-   // Test /proc/PID/smaps_rollup availability (faster to parse, Linux 4.14+)
-   this->haveSmapsRollup = (access(PROCDIR "/self/smaps_rollup", R_OK) == 0);
+    ContainerResolver_init();
+
+    // Test /proc/PID/smaps_rollup availability (faster to parse, Linux 4.14+)
+    this->haveSmapsRollup = (access(PROCDIR "/self/smaps_rollup", R_OK) == 0);
 
    // Read PID namespace inode number
    {
@@ -293,10 +296,11 @@ void ProcessTable_delete(Object* cast) {
       }
       free(this->ttyDrivers);
    }
-   #ifdef HAVE_DELAYACCT
-   LibNl_destroyNetlinkSocket(this);
-   #endif
-   free(this);
+    #ifdef HAVE_DELAYACCT
+    LibNl_destroyNetlinkSocket(this);
+    #endif
+    ContainerResolver_done();
+    free(this);
 }
 
 static inline unsigned long long LinuxProcessTable_adjustTime(const LinuxMachine* lhost, unsigned long long t) {
@@ -915,8 +919,8 @@ static bool LinuxProcessTable_readSmapsFile(LinuxProcess* process, openat_arg_t 
 /*
  * Read /proc/<pid>/cgroup (thread-specific data)
  */
-static void LinuxProcessTable_readCGroupFile(LinuxProcess* process, openat_arg_t procFd) {
-   FILE* file = fopenat(procFd, "cgroup", "r");
+static void LinuxProcessTable_readCGroupFile(LinuxProcess* process, openat_arg_t procFd, bool resolveNames) {
+    FILE* file = fopenat(procFd, "cgroup", "r");
    if (!file) {
       if (process->cgroup) {
          free(process->cgroup);
@@ -1003,17 +1007,48 @@ static void LinuxProcessTable_readCGroupFile(LinuxProcess* process, openat_arg_t
       process->cgroup_short = NULL;
    }
 
-   char* container_short = CGroup_filterContainer(process->cgroup);
-   if (container_short) {
-      Row_updateFieldWidth(CONTAINER, strlen(container_short));
-      free_and_xStrdup(&process->container_short, container_short);
-      free(container_short);
-   } else {
-      //CONTAINER is just "N/A" if shortening fails
-      Row_updateFieldWidth(CONTAINER, strlen("N/A"));
-      free(process->container_short);
-      process->container_short = NULL;
-   }
+    char* container_short = CGroup_filterContainer(process->cgroup);
+    if (container_short) {
+       // Try to resolve container ID to human-readable name
+       if (resolveNames) {
+          const char* colon = strchr(container_short, ':');
+          if (colon && colon - container_short >= 1 && colon[1]) {
+             const char* id = colon + 1;
+             size_t idLen = strlen(id);
+
+             // Only try resolution for hex IDs (Docker/Podman), not named containers (LXC)
+             if (idLen == CONTAINER_ID_LEN) {
+                bool isHexId = true;
+                for (size_t i = 0; i < idLen; i++) {
+                   char c = id[i];
+                   if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                      isHexId = false;
+                      break;
+                   }
+                }
+
+                if (isHexId) {
+                   const char* resolvedName = ContainerResolver_lookup(id);
+                   if (resolvedName) {
+                      Row_updateFieldWidth(CONTAINER, strlen(resolvedName));
+                      free_and_xStrdup(&process->container_short, resolvedName);
+                      free(container_short);
+                      return;
+                   }
+                }
+             }
+          }
+       }
+
+       Row_updateFieldWidth(CONTAINER, strlen(container_short));
+       free_and_xStrdup(&process->container_short, container_short);
+       free(container_short);
+    } else {
+       //CONTAINER is just "N/A" if shortening fails
+       Row_updateFieldWidth(CONTAINER, strlen("N/A"));
+       free(process->container_short);
+       process->container_short = NULL;
+    }
 }
 
 /*
@@ -1714,10 +1749,10 @@ static bool LinuxProcessTable_recurseProcTree(LinuxProcessTable* this, openat_ar
          }
       }
 
-      if (ss->flags & PROCESS_FLAG_LINUX_CGROUP)
-         LinuxProcessTable_readCGroupFile(lp, procFd);
+       if (ss->flags & PROCESS_FLAG_LINUX_CGROUP)
+          LinuxProcessTable_readCGroupFile(lp, procFd, settings->resolveContainerNames);
 
-      if ((ss->flags & PROCESS_FLAG_LINUX_SMAPS) && !Process_isKernelThread(proc)) {
+       if ((ss->flags & PROCESS_FLAG_LINUX_SMAPS) && !Process_isKernelThread(proc)) {
          if (!mainTask) {
             // Read smaps file of each process only every second pass to improve performance
             static int smaps_flag = 0;
@@ -1840,6 +1875,8 @@ void ProcessTable_goThroughEntries(ProcessTable* super) {
    Machine* host = super->super.host;
    const Settings* settings = host->settings;
    LinuxMachine* lhost = (LinuxMachine*) host;
+
+   ContainerResolver_maybeRefresh(host->realtimeMs);
 
    if (settings->ss->flags & PROCESS_FLAG_LINUX_AUTOGROUP) {
       // Refer to sched(7) 'autogroup feature' section

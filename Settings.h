@@ -88,8 +88,11 @@ typedef struct Settings_ {
    bool shadowOtherUsers;
    bool showThreadNames;
    bool hideKernelThreads;
-   bool hideRunningInContainer;
-   bool hideUserlandThreads;
+    bool hideRunningInContainer;
+    #ifdef HTOP_LINUX
+    bool resolveContainerNames;
+    #endif
+    bool hideUserlandThreads;
    bool highlightBaseName;
    bool highlightDeletedExe;
    bool shadowDistPathPrefix;
