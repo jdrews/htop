@@ -178,9 +178,120 @@ static int sortTtyDrivers(const void* va, const void* vb) {
       return r;
 
    return SPACESHIP_NUMBER(a->minorFrom, b->minorFrom);
+ }
+
+ /* Container name resolution -- inline cache, refreshed every 5 seconds */
+#define CONTAINER_ID_LEN 12
+#define CONTAINER_NAME_MAX 256
+#define CONTAINER_CACHE_SIZE 128
+#define CONTAINER_REFRESH_MS (5 * 1000)
+
+typedef struct {
+   char id[CONTAINER_ID_LEN + 1];
+   char name[CONTAINER_NAME_MAX];
+} ContainerNameEntry;
+
+static struct {
+   ContainerNameEntry entries[CONTAINER_CACHE_SIZE];
+   int size;
+   bool available;
+   uint64_t lastRefreshMs;
+   bool prevResolveNames;
+   bool resolveJustTurnedOff;
+} containerCache = { 0 };
+
+static void LinuxProcessTable_containerRefresh(void) {
+   const char* cmds[] = {
+      "docker ps --format '{{.ID}}\t{{.Names}}' 2>/dev/null",
+      "podman ps --format '{{.ID}}\t{{.Names}}' 2>/dev/null",
+   };
+
+   FILE* fp = NULL;
+   for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+      FILE* testFp = popen(cmds[i], "r");
+      if (!testFp)
+         continue;
+
+      // Check if command produced any output before committing to it
+      char line[CONTAINER_NAME_MAX + CONTAINER_ID_LEN + 4];
+      if (fgets(line, sizeof(line), testFp)) {
+         pclose(testFp);
+         fp = popen(cmds[i], "r");
+         break;
+      }
+
+      pclose(testFp);
+   }
+
+   if (!fp) {
+      containerCache.available = false;
+      return;
+   }
+
+   containerCache.size = 0;
+   char line[CONTAINER_NAME_MAX + CONTAINER_ID_LEN + 4];
+   while (fgets(line, sizeof(line), fp)) {
+      char* nl = strchr(line, '\n');
+      if (nl)
+         *nl = '\0';
+
+      if (line[0] == '\0')
+         continue;
+
+      char* tab = strchr(line, '\t');
+      if (!tab || tab[1] == '\0')
+         continue;
+
+      *tab = '\0';
+      const char* id = line;
+      size_t idLen = strlen(id);
+      if (idLen > CONTAINER_ID_LEN)
+         idLen = CONTAINER_ID_LEN;
+
+      if ((size_t)containerCache.size < CONTAINER_CACHE_SIZE) {
+         ContainerNameEntry* entry = &containerCache.entries[containerCache.size++];
+         String_safeStrncpy(entry->id, id, CONTAINER_ID_LEN + 1);
+         entry->id[idLen] = '\0';
+         String_safeStrncpy(entry->name, tab + 1, CONTAINER_NAME_MAX);
+      }
+   }
+
+   pclose(fp);
+   containerCache.available = true;
 }
 
-static void LinuxProcessTable_initTtyDrivers(LinuxProcessTable* this) {
+static const char* LinuxProcessTable_containerLookup(const char* id) {
+   if (!containerCache.available || !id)
+      return NULL;
+
+   for (int i = 0; i < containerCache.size; i++) {
+      if (strncmp(containerCache.entries[i].id, id, CONTAINER_ID_LEN + 1) == 0)
+         return containerCache.entries[i].name;
+   }
+
+   return NULL;
+}
+
+static void LinuxProcessTable_resolveContainerName(LinuxProcess* process, const char* containerShort, bool resolveNames) {
+   if (resolveNames && containerShort) {
+      const char* colon = strchr(containerShort, ':');
+      if (colon && colon - containerShort >= 1 && colon[1] &&
+          strspn(colon + 1, "0123456789abcdef") == CONTAINER_ID_LEN) {
+         const char* resolvedName = LinuxProcessTable_containerLookup(colon + 1);
+         if (resolvedName) {
+            Row_updateFieldWidth(CONTAINER, strlen(resolvedName));
+            free_and_xStrdup(&process->container_short, resolvedName);
+            return;
+         }
+      }
+   }
+
+   // Unresolved or resolution disabled — use original format
+   Row_updateFieldWidth(CONTAINER, strlen(containerShort));
+   free_and_xStrdup(&process->container_short, containerShort);
+}
+
+ static void LinuxProcessTable_initTtyDrivers(LinuxProcessTable* this) {
    TtyDriver* ttyDrivers;
 
    char buf[16384];
@@ -266,6 +377,8 @@ ProcessTable* ProcessTable_new(Machine* host, Hashtable* pidMatchList) {
    ProcessTable_init(super, Class(LinuxProcess), host, pidMatchList);
 
    LinuxProcessTable_initTtyDrivers(this);
+
+   LinuxProcessTable_containerRefresh();
 
    // Test /proc/PID/smaps_rollup availability (faster to parse, Linux 4.14+)
    this->haveSmapsRollup = (access(PROCDIR "/self/smaps_rollup", R_OK) == 0);
@@ -915,7 +1028,7 @@ static bool LinuxProcessTable_readSmapsFile(LinuxProcess* process, openat_arg_t 
 /*
  * Read /proc/<pid>/cgroup (thread-specific data)
  */
-static void LinuxProcessTable_readCGroupFile(LinuxProcess* process, openat_arg_t procFd) {
+static void LinuxProcessTable_readCGroupFile(LinuxProcess* process, openat_arg_t procFd, bool resolveNames) {
    FILE* file = fopenat(procFd, "cgroup", "r");
    if (!file) {
       if (process->cgroup) {
@@ -983,6 +1096,28 @@ static void LinuxProcessTable_readCGroupFile(LinuxProcess* process, openat_arg_t
          //CCGROUP is alias to normal CGROUP if shortening fails
          Row_updateFieldWidth(CCGROUP, strlen(process->cgroup));
       }
+
+      // Regenerate unresolved format when resolution turned off
+      if (containerCache.resolveJustTurnedOff && process->container_short != NULL) {
+         char* containerShort = CGroup_filterContainer(process->cgroup);
+         if (containerShort) {
+            LinuxProcessTable_resolveContainerName(process, containerShort, false);
+            free(containerShort);
+         }
+      } else if (resolveNames && process->container_short != NULL) {
+         // Re-resolve when resolution turned on and we have an unresolved ID
+         const char* colon = strchr(process->container_short, ':');
+         if (colon && colon - process->container_short >= 1 && colon[1] &&
+             strspn(colon + 1, "0123456789abcdef") == CONTAINER_ID_LEN) {
+            const char* resolvedName = LinuxProcessTable_containerLookup(colon + 1);
+            if (resolvedName) {
+               Row_updateFieldWidth(CONTAINER, strlen(resolvedName));
+               free_and_xStrdup(&process->container_short, resolvedName);
+               return;
+            }
+         }
+      }
+
       if (process->container_short) {
          Row_updateFieldWidth(CONTAINER, strlen(process->container_short));
       } else {
@@ -1003,11 +1138,10 @@ static void LinuxProcessTable_readCGroupFile(LinuxProcess* process, openat_arg_t
       process->cgroup_short = NULL;
    }
 
-   char* container_short = CGroup_filterContainer(process->cgroup);
-   if (container_short) {
-      Row_updateFieldWidth(CONTAINER, strlen(container_short));
-      free_and_xStrdup(&process->container_short, container_short);
-      free(container_short);
+   char* containerShort = CGroup_filterContainer(process->cgroup);
+   if (containerShort) {
+      LinuxProcessTable_resolveContainerName(process, containerShort, resolveNames);
+      free(containerShort);
    } else {
       //CONTAINER is just "N/A" if shortening fails
       Row_updateFieldWidth(CONTAINER, strlen("N/A"));
@@ -1714,10 +1848,10 @@ static bool LinuxProcessTable_recurseProcTree(LinuxProcessTable* this, openat_ar
          }
       }
 
-      if (ss->flags & PROCESS_FLAG_LINUX_CGROUP)
-         LinuxProcessTable_readCGroupFile(lp, procFd);
+       if (ss->flags & PROCESS_FLAG_LINUX_CGROUP)
+          LinuxProcessTable_readCGroupFile(lp, procFd, settings->resolveContainerNames);
 
-      if ((ss->flags & PROCESS_FLAG_LINUX_SMAPS) && !Process_isKernelThread(proc)) {
+       if ((ss->flags & PROCESS_FLAG_LINUX_SMAPS) && !Process_isKernelThread(proc)) {
          if (!mainTask) {
             // Read smaps file of each process only every second pass to improve performance
             static int smaps_flag = 0;
@@ -1841,6 +1975,19 @@ void ProcessTable_goThroughEntries(ProcessTable* super) {
    const Settings* settings = host->settings;
    LinuxMachine* lhost = (LinuxMachine*) host;
 
+   if (settings->resolveContainerNames != containerCache.prevResolveNames) {
+      containerCache.prevResolveNames = settings->resolveContainerNames;
+      if (!settings->resolveContainerNames) {
+         containerCache.resolveJustTurnedOff = true;
+      } else if (!containerCache.available) {
+         LinuxProcessTable_containerRefresh();
+         containerCache.lastRefreshMs = host->realtimeMs;
+      }
+   } else if ((host->realtimeMs - containerCache.lastRefreshMs) >= CONTAINER_REFRESH_MS) {
+      LinuxProcessTable_containerRefresh();
+      containerCache.lastRefreshMs = host->realtimeMs;
+   }
+
    if (settings->ss->flags & PROCESS_FLAG_LINUX_AUTOGROUP) {
       // Refer to sched(7) 'autogroup feature' section
       // The kernel feature can be enabled/disabled through procfs at
@@ -1871,4 +2018,6 @@ void ProcessTable_goThroughEntries(ProcessTable* super) {
 #endif
 
    LinuxProcessTable_recurseProcTree(this, rootFd, lhost, PROCDIR, NULL);
+
+   containerCache.resolveJustTurnedOff = false;
 }

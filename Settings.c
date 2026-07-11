@@ -429,6 +429,10 @@ static bool Settings_read(Settings* this, const char* fileName, const Machine* h
          this->hideUserlandThreads = atoi(option[1]);
       } else if (String_eq(option[0], "hide_running_in_container")) {
          this->hideRunningInContainer = atoi(option[1]);
+      } else if (String_eq(option[0], "resolve_container_names")) {
+         #ifdef HTOP_LINUX
+         this->resolveContainerNames = atoi(option[1]);
+         #endif
       } else if (String_eq(option[0], "shadow_other_users")) {
          this->shadowOtherUsers = atoi(option[1]);
       } else if (String_eq(option[0], "show_thread_names")) {
@@ -696,6 +700,9 @@ int Settings_write(const Settings* this, bool onCrash) {
    printSettingInteger("hide_kernel_threads", this->hideKernelThreads);
    printSettingInteger("hide_userland_threads", this->hideUserlandThreads);
    printSettingInteger("hide_running_in_container", this->hideRunningInContainer);
+   #ifdef HTOP_LINUX
+   printSettingInteger("resolve_container_names", this->resolveContainerNames);
+   #endif
    printSettingInteger("shadow_other_users", this->shadowOtherUsers);
    printSettingInteger("show_thread_names", this->showThreadNames);
    printSettingInteger("show_program_path", this->showProgramPath);
